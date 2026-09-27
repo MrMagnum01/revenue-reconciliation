@@ -45,6 +45,14 @@ def test_currency_mismatch():
     assert [m.category for m in result.mismatches] == ["currency_mismatch"]
 
 
+def test_currency_mismatch_with_larger_amount_is_not_an_overpayment():
+    # EUR 20000 against a USD 10000 order: different units, not comparable.
+    orders = [Order("ORD-1", "CUST-1", D, "USD", 10000, "completed")]
+    payments = [Payment("PAY-1", "ORD-1", D, "EUR", 20000, "card")]
+    result = reconcile(orders, payments, [])
+    assert [m.category for m in result.mismatches] == ["currency_mismatch"]
+
+
 def test_duplicate_payment():
     orders = [Order("ORD-1", "CUST-1", D, "USD", 1000, "completed")]
     payments = [
@@ -70,8 +78,8 @@ def test_unmatched_payment_is_a_kpi_not_a_mismatch():
     assert result.mismatches == []
     totals = result.totals()
     assert totals["unmatched_count"] == 1
-    assert totals["unmatched_cents"] == 500
-    assert totals["gross_cents"] == 500
+    assert totals["USD"]["unmatched_cents"] == 500
+    assert totals["USD"]["gross_cents"] == 500
 
 
 def test_legitimate_refund_reduces_net_not_flagged():
@@ -81,6 +89,6 @@ def test_legitimate_refund_reduces_net_not_flagged():
     result = reconcile(orders, payments, refunds)
     assert result.mismatches == []
     totals = result.totals()
-    assert totals["gross_cents"] == 1000
-    assert totals["refunds_cents"] == 300
-    assert totals["net_cents"] == 700
+    assert totals["USD"]["gross_cents"] == 1000
+    assert totals["USD"]["refunds_cents"] == 300
+    assert totals["USD"]["net_cents"] == 700

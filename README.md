@@ -15,9 +15,11 @@ plants a known set of mismatches, and records the true totals it built -
 so the whole pipeline can be demoed and tested without any real business
 data. No code, data, or client project is reused here.
 
-**Role:** Automation engineer - designed and directed the build (AI-assisted
-coding). Everything described below as built has working code and a
-passing test in this repo; nothing here is described as done unless it is.
+**Provenance:** This repository was implemented by AI coding agents and
+independently reviewed by a separate AI reviewer; the repository owner
+reviewed and approved the result. Everything described below as built has
+working code and a passing test in this repo; nothing here is described as
+done unless it is.
 
 ## What it does
 
@@ -34,7 +36,9 @@ passing test in this repo; nothing here is described as done unless it is.
      demo).
    - `mismatch_report.json` / `mismatches.csv` - the same mismatch rows and
      aggregate totals, in a shape that's easy to alert on without a SQL
-     query.
+     query. The report carries a top-level `status` (`complete` /
+     `incomplete` / `failed`) and `ok` flag, and the CLI exits non-zero
+     unless the run is `complete` (see "Run status" below).
 3. **`run`** - `generate` + `reconcile` in one step; this is what the
    scheduled job (below) calls.
 
@@ -49,19 +53,59 @@ handling. `reconcile --orders-fixture` starts one of these in-process
 against a JSON fixture and tears it down afterwards; `--orders-api-url`
 talks to an already-running one (real deployment shape).
 
+### Money is never combined across currencies
+
+There is no FX conversion anywhere. Every money total - report totals,
+daily KPIs (one row per `(run_id, day, currency)`), and per-category
+mismatch amounts - is partitioned by currency. A USD 100 payment and a
+EUR 100 payment are reported as `USD 10000c` and `EUR 10000c`, never as
+one `20000c` figure. Only counts (e.g. `unmatched_count`) are summed across
+currencies.
+
 ### Mismatch categories
 
 | Category | Meaning |
 |---|---|
-| `missing_payment` | A completed order with zero payments recorded. |
-| `overpayment` | A payment greater than its order's amount (amount shown = excess only). |
-| `orphan_refund` | A refund whose `order_id` matches no known order. |
-| `currency_mismatch` | A payment whose currency differs from its order's. |
-| `duplicate` | An order with more than one payment recorded for it. |
+| `missing_payment` | A completed order with zero payments recorded (asserted only when the payments source is complete). |
+| `overpayment` | A payment greater than its order's amount, **same currency only** (amount shown = excess). |
+| `orphan_refund` | A refund whose `order_id` matches no known order (asserted only when the orders source is complete). |
+| `currency_mismatch` | A payment whose currency differs from its order's. This is the only finding for such a payment - amounts in different currencies are never compared, so no over/under-payment is computed. |
+| `duplicate` | An order with more than one (distinct) payment recorded for it. |
+| `indeterminate_incomplete_source` | A finding that would rest on a record being *absent* (missing payment, orphan refund, unmatched payment) while the source that should hold it is incomplete this run. Reported separately instead of asserted. |
 
 "Unmatched" (a KPI, not a mismatch category) is a payment whose order_id
 matches no order at all - see [`docs/schema.md`](docs/schema.md) for why
 that's kept separate.
+
+### Run status
+
+Each source (orders API, payments CSV, refunds CSV) ends a run as `ok`,
+`partial` (some records rejected: API failure mid-listing, malformed
+record/row, conflicting ids) or `failed` (error and nothing usable). The
+run is `complete` only if every source is `ok`, `failed` if every source
+failed, otherwise `incomplete`. Status and the list of incomplete sources
+are written to the `runs` table, each failure/rejection to `run_issues`,
+and both to the report. `reconcile` / `run` exit `0` for `complete`, `2`
+for `incomplete`, `1` for `failed` or an error. A database consumer can
+therefore tell an orders-API outage from a clean run with real unmatched
+payments without reading the JSON report.
+
+### One row per source id
+
+The pipeline treats one row per source id (`order_id`, `payment_id`,
+`refund_id`) as one event:
+
+- **Exact duplicates** (same id, identical fields) are collapsed to one
+  row before anything else, so the report and the database count it once.
+- **Conflicting ids** (same id, different fields) are a data error: all
+  rows with that id are rejected (not guessed between), excluded from
+  totals and the database, reported under `conflicts` / `conflicts_count`
+  and in `run_issues`, and the source is marked `partial`.
+- The same accepted rows feed both the report and the database.
+
+**Known limitation:** a genuine split tender - two distinct charges that
+happen to share one id - cannot be told apart from a conflict and is
+rejected as one. The pipeline does not attempt to solve this.
 
 ## Setup
 
@@ -113,27 +157,50 @@ export PYTHONPATH=src
 pytest tests -v
 ```
 
-29/29 passing. Covers:
+51/51 passing. Covers:
 - **Known-total reconciliation** (`test_generator_truth.py`) - the
   generator plants a disjoint set of mismatches per category and records
   ground truth independently; `reconcile()`'s output is asserted equal to
   that ground truth, exactly, to the cent.
 - **API failure handling** (`test_api_failures.py`) - per-order and
   bulk-endpoint HTTP 500s and timeouts, a closed port (connection refused),
-  and successful pagination across multiple pages.
+  successful pagination across multiple pages, malformed records (missing
+  field, string/bool/fractional cents) skipped and reported as
+  `malformed_record`, and bounded pagination (missing page size, empty
+  pages, a listing that never reaches its advertised total).
 - **Malformed CSV handling** (`test_malformed_csv.py`) - bad amount, bad
   date, missing column, empty body - every case is skipped and reported as
   a `ParseError`, never a crash.
+- **Review probes** (`test_astra_probes.py`) - regression tests from an
+  independent review: per-currency totals, no cross-currency overpayment,
+  short and extra-column CSV rows, exact-duplicate and conflicting ids
+  (report and DB agree), API outage recorded as `incomplete` with nothing
+  asserted as unmatched, per-run KPI history preserved, all-or-nothing DB
+  writes, malformed API records, fractional cents rejected.
 - **Reconciliation unit tests** (`test_reconcile_unit.py`) - one
   handcrafted case per mismatch category, isolated from the generator.
-- **Pipeline + CLI** (`test_pipeline_cli.py`) - end-to-end DuckDB write,
-  an API-outage run that still completes, and a subprocess smoke test of
-  the CLI itself (`generate`, `reconcile`, `run`).
+- **Pipeline + CLI** (`test_pipeline_cli.py`) - end-to-end DuckDB write
+  (report totals = DB KPI sums = raw table sums, per currency), an
+  API-outage run recorded as `incomplete` in both report and `runs`, and a
+  subprocess smoke test of the CLI itself (`generate`, `reconcile`, `run`,
+  and a non-zero exit when the orders API is down).
 
 ## Limits
 
 - **No FX conversion.** Currency is read as the printed 3-letter code;
-  `currency_mismatch` is detected, never auto-corrected or converted.
+  `currency_mismatch` is detected, never auto-corrected or converted, and
+  totals are reported per currency rather than as one grand total.
+- **Raw tables are latest-state, not history.** `daily_kpis`,
+  `mismatches`, `runs` and `run_issues` are kept per `run_id`, so earlier
+  runs' KPIs stay as they were computed. The raw `orders`, `payments` and
+  `refunds` tables are upserted by id and hold only the most recently
+  ingested version of each record; they cannot be used to replay or
+  recompute an earlier run. Per-run raw snapshots are **not built**.
+- **Writes are all-or-nothing per run** (one transaction); a failed write
+  leaves no rows from that run. A database created by an earlier schema
+  version is refused with a clear error - point `--db` at a new file.
+- **Split tender** under one payment id is rejected as an id conflict (see
+  "One row per source id").
 - **Reconciliation is a single pass over one `payments.csv`/`refunds.csv`
   pair per run** - it does not track state across runs (e.g. a payment
   that finally arrives a week late would show up as a new row in the next
@@ -157,9 +224,9 @@ src/revenue_reconciliation/
   api_client.py   HTTP client: timeout + retry, classifies every failure
   generator.py    deterministic synthetic corpus + planted mismatches + truth.json
   loaders.py      payments.csv / refunds.csv readers, malformed rows -> ParseError
-  reconcile.py    matching + categorisation + daily KPI aggregation
-  db.py           DuckDB schema + writer (see docs/schema.md)
-  pipeline.py     orchestrates one run: fetch -> load -> reconcile -> write
+  reconcile.py    one-row-per-id dedupe, matching, categorisation, per-currency daily KPIs
+  db.py           DuckDB schema + transactional writer (see docs/schema.md)
+  pipeline.py     orchestrates one run: fetch -> load -> dedupe -> reconcile -> write, sets run status
   cli.py          `generate` / `reconcile` / `run` subcommands
 tests/            pytest suite (see "Tests" above)
 docs/schema.md    DuckDB schema, documented for reuse by a later dashboard demo

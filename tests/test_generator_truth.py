@@ -16,13 +16,17 @@ def test_known_totals_match_exactly():
     got = result.totals()
 
     expected = truth["totals_cents"]
-    assert got["gross_cents"] == expected["gross"]
-    assert got["net_cents"] == expected["net"]
-    assert got["refunds_cents"] == expected["refunds"]
-    assert got["paid_cents"] == expected["paid"]
-    assert got["ordered_cents"] == expected["ordered"]
-    assert got["unmatched_cents"] == expected["unmatched"]
+    got_currencies = {k for k, v in got.items() if isinstance(v, dict)}
+    assert got_currencies == set(expected) == {"USD", "EUR", "GBP"}
+    for cur, exp in expected.items():
+        assert got[cur]["gross_cents"] == exp["gross"], cur
+        assert got[cur]["net_cents"] == exp["net"], cur
+        assert got[cur]["refunds_cents"] == exp["refunds"], cur
+        assert got[cur]["paid_cents"] == exp["paid"], cur
+        assert got[cur]["ordered_cents"] == exp["ordered"], cur
+        assert got[cur]["unmatched_cents"] == exp["unmatched"], cur
     assert got["unmatched_count"] == truth["unmatched_count"]
+    assert got["indeterminate_count"] == 0
 
 
 def test_mismatch_categories_match_exactly():
@@ -49,6 +53,12 @@ def test_daily_kpis_sum_to_totals():
     orders, payments, refunds, truth = generate_corpus(seed=42)
     result = reconcile(orders, payments, refunds)
     totals = result.totals()
-    assert sum(k.gross_cents for k in result.daily_kpis) == totals["gross_cents"]
-    assert sum(k.refunds_cents for k in result.daily_kpis) == totals["refunds_cents"]
-    assert sum(k.net_cents for k in result.daily_kpis) == totals["net_cents"]
+    for cur in ("USD", "EUR", "GBP"):
+        rows = [k for k in result.daily_kpis if k.currency == cur]
+        assert rows, cur
+        assert sum(k.gross_cents for k in rows) == totals[cur]["gross_cents"]
+        assert sum(k.refunds_cents for k in rows) == totals[cur]["refunds_cents"]
+        assert sum(k.net_cents for k in rows) == totals[cur]["net_cents"]
+    # one KPI row per (day, currency), never a combined-currency row
+    keys = [(k.day, k.currency) for k in result.daily_kpis]
+    assert len(keys) == len(set(keys))

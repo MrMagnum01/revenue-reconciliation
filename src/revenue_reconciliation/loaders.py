@@ -1,19 +1,27 @@
 """CSV loaders for payments and refunds.
 
-A malformed row (missing column, non-integer amount, unparseable date)
-never crashes the run: it is skipped and recorded as a `ParseError` so the
-mismatch report can say exactly what was dropped and why.
+A malformed row (wrong number of fields, non-integer amount, unparseable
+date, empty required value) never crashes the run: by default it is
+skipped and recorded as a categorised `ParseError` so the mismatch report
+can say exactly what was dropped and why. Pass `strict=True` to raise a
+`MalformedRecordError` on the first malformed row instead.
+
+Error messages and `raw_row` are built only from plain strings, so
+describing a malformed row can never itself raise.
 """
 from __future__ import annotations
 
 import csv
 from datetime import date
 from pathlib import Path
+from typing import Callable, TypeVar
 
-from .models import ParseError, Payment, Refund
+from .models import MalformedRecordError, ParseError, Payment, Refund
 
 PAYMENTS_FIELDS = ["payment_id", "order_id", "payment_date", "currency", "amount_cents", "method"]
 REFUNDS_FIELDS = ["refund_id", "order_id", "refund_date", "currency", "amount_cents", "reason"]
+
+T = TypeVar("T")
 
 
 def _parse_date(raw: str) -> date:
@@ -21,57 +29,90 @@ def _parse_date(raw: str) -> date:
 
 
 def _parse_cents(raw: str) -> int:
-    # Reject floats-as-strings too ("12.5") - amounts are integer cents only.
-    return int(raw.strip())
+    # Integer cents only: "12.5", "12.50", "1e3" and "" are all rejected.
+    text = raw.strip()
+    if not text.lstrip("-").isdigit():
+        raise ValueError(f"amount_cents must be an integer number of cents, got {raw!r}")
+    return int(text)
 
 
-def load_payments(path: Path) -> tuple[list[Payment], list[ParseError]]:
-    payments: list[Payment] = []
+def _text(raw: str, field: str) -> str:
+    value = raw.strip()
+    if not value:
+        raise ValueError(f"{field} is empty")
+    return value
+
+
+def _load(
+    path: Path,
+    required: list[str],
+    build: Callable[[dict[str, str]], T],
+    strict: bool,
+) -> tuple[list[T], list[ParseError]]:
+    records: list[T] = []
     errors: list[ParseError] = []
+    source = str(path)
+
+    def fail(line: int, raw: list[str], category: str, reason: str) -> None:
+        if strict:
+            raise MalformedRecordError(source, line, category, reason)
+        errors.append(ParseError(source, line, ",".join(raw), reason, category))
+
     with Path(path).open(newline="", encoding="utf-8") as fh:
-        reader = csv.DictReader(fh)
-        missing = [f for f in PAYMENTS_FIELDS if f not in (reader.fieldnames or [])]
+        reader = csv.reader(fh)
+        header = next(reader, None)
+        if header is None:
+            return records, errors  # empty file: nothing to load, nothing wrong
+        header = [h.strip() for h in header]
+        missing = [f for f in required if f not in header]
         if missing:
-            errors.append(ParseError(str(path), 1, ",".join(reader.fieldnames or []), f"missing columns: {missing}"))
-            return payments, errors
-        for i, row in enumerate(reader, start=2):
-            try:
-                payments.append(
-                    Payment(
-                        payment_id=row["payment_id"].strip(),
-                        order_id=row["order_id"].strip(),
-                        payment_date=_parse_date(row["payment_date"]),
-                        currency=row["currency"].strip(),
-                        amount_cents=_parse_cents(row["amount_cents"]),
-                        method=row["method"].strip(),
-                    )
+            fail(1, header, "missing_columns", f"missing columns: {missing}")
+            return records, errors
+        for raw in reader:
+            line = reader.line_num
+            if not raw:
+                continue  # blank line
+            if len(raw) != len(header):
+                fail(
+                    line,
+                    raw,
+                    "wrong_field_count",
+                    f"expected {len(header)} fields ({','.join(header)}), got {len(raw)}",
                 )
-            except (ValueError, AttributeError, KeyError, TypeError) as exc:
-                errors.append(ParseError(str(path), i, ",".join(row.values()), str(exc)))
-    return payments, errors
+                continue
+            row = dict(zip(header, raw))
+            try:
+                records.append(build(row))
+            except ValueError as exc:
+                fail(line, raw, "invalid_value", str(exc))
+    return records, errors
 
 
-def load_refunds(path: Path) -> tuple[list[Refund], list[ParseError]]:
-    refunds: list[Refund] = []
-    errors: list[ParseError] = []
-    with Path(path).open(newline="", encoding="utf-8") as fh:
-        reader = csv.DictReader(fh)
-        missing = [f for f in REFUNDS_FIELDS if f not in (reader.fieldnames or [])]
-        if missing:
-            errors.append(ParseError(str(path), 1, ",".join(reader.fieldnames or []), f"missing columns: {missing}"))
-            return refunds, errors
-        for i, row in enumerate(reader, start=2):
-            try:
-                refunds.append(
-                    Refund(
-                        refund_id=row["refund_id"].strip(),
-                        order_id=row["order_id"].strip(),
-                        refund_date=_parse_date(row["refund_date"]),
-                        currency=row["currency"].strip(),
-                        amount_cents=_parse_cents(row["amount_cents"]),
-                        reason=row["reason"].strip(),
-                    )
-                )
-            except (ValueError, AttributeError, KeyError, TypeError) as exc:
-                errors.append(ParseError(str(path), i, ",".join(row.values()), str(exc)))
-    return refunds, errors
+def _build_payment(row: dict[str, str]) -> Payment:
+    return Payment(
+        payment_id=_text(row["payment_id"], "payment_id"),
+        order_id=_text(row["order_id"], "order_id"),
+        payment_date=_parse_date(row["payment_date"]),
+        currency=_text(row["currency"], "currency"),
+        amount_cents=_parse_cents(row["amount_cents"]),
+        method=_text(row["method"], "method"),
+    )
+
+
+def _build_refund(row: dict[str, str]) -> Refund:
+    return Refund(
+        refund_id=_text(row["refund_id"], "refund_id"),
+        order_id=_text(row["order_id"], "order_id"),
+        refund_date=_parse_date(row["refund_date"]),
+        currency=_text(row["currency"], "currency"),
+        amount_cents=_parse_cents(row["amount_cents"]),
+        reason=_text(row["reason"], "reason"),
+    )
+
+
+def load_payments(path: Path, *, strict: bool = False) -> tuple[list[Payment], list[ParseError]]:
+    return _load(Path(path), PAYMENTS_FIELDS, _build_payment, strict)
+
+
+def load_refunds(path: Path, *, strict: bool = False) -> tuple[list[Refund], list[ParseError]]:
+    return _load(Path(path), REFUNDS_FIELDS, _build_refund, strict)

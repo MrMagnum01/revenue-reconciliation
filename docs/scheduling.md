@@ -67,9 +67,15 @@ run on this build box**; this is reference only.
 
 ## Alerting on mismatches
 
-`mismatch_report.json` (written to `--out` alongside the DuckDB file) has a
-flat, greppable shape - `report["mismatches"]["missing_payment"]["count"]`
-etc - so a scheduled run can pipe it into a simple threshold check (e.g.
-`jq` in the same cron line, or a follow-up script) without querying DuckDB
-at all. The DuckDB `mismatches` table is there for anyone who wants to
+The CLI exits non-zero unless the run is `complete` (`2` = incomplete,
+`1` = failed or error), so cron/systemd already surface an ingestion
+outage as a failed job. `mismatch_report.json` (written to `--out`
+alongside the DuckDB file) has a flat, greppable shape -
+`report["status"]`, `report["ok"]`, `report["mismatches"]["missing_payment"]["count"]`,
+and per-currency amounts under
+`report["mismatches"][<category>]["amount_cents_by_currency"]` - so a
+scheduled run can pipe it into a simple threshold check (e.g. `jq` in the
+same cron line, or a follow-up script) without querying DuckDB at all.
+Check `status` first: counts from an `incomplete` run exclude findings
+that could not be determined. The DuckDB `mismatches` table is there for anyone who wants to
 slice by date range or category with SQL instead.

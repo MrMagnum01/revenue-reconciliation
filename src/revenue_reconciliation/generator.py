@@ -9,11 +9,15 @@ The generator plants a known, disjoint set of problems and returns a
 `truth` dict recording the ground truth it built - independent bookkeeping,
 not derived from `reconcile.py` - so comparing the pipeline's output to
 `truth` is a real check of the reconciliation logic, not a tautology.
+
+Money in the truth dict is partitioned by currency, exactly as the
+pipeline reports it: amounts in different currencies are never added.
 """
 from __future__ import annotations
 
 import json
 import random
+from collections import defaultdict
 from dataclasses import asdict
 from datetime import date, timedelta
 from pathlib import Path
@@ -99,11 +103,13 @@ def generate_corpus(seed: int = 42) -> tuple[list[Order], list[Payment], list[Re
         pay_seq += 1
         return pid
 
-    truth_missing_amount = 0
-    for oid in missing_ids:
-        truth_missing_amount += orders_by_id[oid].amount_cents  # no payment created
+    # Planted-mismatch ground truth: {category: {currency: cents}} and counts.
+    truth_amounts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
 
-    truth_overpay_amount = 0
+    for oid in missing_ids:
+        o = orders_by_id[oid]
+        truth_amounts["missing_payment"][o.currency] += o.amount_cents  # no payment created
+
     for oid in overpay_ids:
         o = orders_by_id[oid]
         extra = rng.randint(500, 3000)
@@ -117,9 +123,8 @@ def generate_corpus(seed: int = 42) -> tuple[list[Order], list[Payment], list[Re
                 method=rng.choice(PAYMENT_METHODS),
             )
         )
-        truth_overpay_amount += extra
+        truth_amounts["overpayment"][o.currency] += extra
 
-    truth_curmis_amount = 0
     for oid in curmis_ids:
         o = orders_by_id[oid]
         bad_currency = _other_currency(rng, o.currency)
@@ -133,9 +138,10 @@ def generate_corpus(seed: int = 42) -> tuple[list[Order], list[Payment], list[Re
                 method=rng.choice(PAYMENT_METHODS),
             )
         )
-        truth_curmis_amount += o.amount_cents
+        # Reported in the payment's (mismatched) currency; no overpayment
+        # is planted or expected, since unlike currencies are not compared.
+        truth_amounts["currency_mismatch"][bad_currency] += o.amount_cents
 
-    truth_dup_amount = 0
     for oid in dup_ids:
         o = orders_by_id[oid]
         first_date = _rand_date(rng, o.order_date, 1)
@@ -146,7 +152,7 @@ def generate_corpus(seed: int = 42) -> tuple[list[Order], list[Payment], list[Re
         payments.append(
             Payment(next_payment_id(), oid, second_date, o.currency, o.amount_cents, rng.choice(PAYMENT_METHODS))
         )
-        truth_dup_amount += o.amount_cents  # the extra (2nd) payment's amount
+        truth_amounts["duplicate"][o.currency] += o.amount_cents  # the extra (2nd) payment's amount
 
     for oid in normal_ids:
         o = orders_by_id[oid]
@@ -161,23 +167,20 @@ def generate_corpus(seed: int = 42) -> tuple[list[Order], list[Payment], list[Re
             )
         )
 
-    truth_unmatched_amount = 0
-    unmatched_payment_ids = []
+    truth_unmatched: dict[str, int] = defaultdict(int)
     for i in range(1, N_UNMATCHED_PAYMENT + 1):
         ghost_order_id = f"ORD-UNMATCHED-{i:04d}"
         amount = rng.randint(1000, 50000)
-        payments.append(
-            Payment(
-                payment_id=next_payment_id(),
-                order_id=ghost_order_id,
-                payment_date=_rand_date(rng, BASE_DATE, NUM_DAYS - 1),
-                currency=rng.choice(CURRENCIES),
-                amount_cents=amount,
-                method=rng.choice(PAYMENT_METHODS),
-            )
+        ghost = Payment(
+            payment_id=next_payment_id(),
+            order_id=ghost_order_id,
+            payment_date=_rand_date(rng, BASE_DATE, NUM_DAYS - 1),
+            currency=rng.choice(CURRENCIES),
+            amount_cents=amount,
+            method=rng.choice(PAYMENT_METHODS),
         )
-        truth_unmatched_amount += amount
-        unmatched_payment_ids.append(ghost_order_id)
+        payments.append(ghost)
+        truth_unmatched[ghost.currency] += amount
 
     # Refunds
     refunds: list[Refund] = []
@@ -207,25 +210,39 @@ def generate_corpus(seed: int = 42) -> tuple[list[Order], list[Payment], list[Re
             )
         )
 
-    truth_orphan_refund_amount = 0
     for i in range(1, N_ORPHAN_REFUND + 1):
         ghost_order_id = f"ORD-ORPHAN-{i:04d}"
         amount = rng.randint(500, 20000)
-        refunds.append(
-            Refund(
-                refund_id=next_refund_id(),
-                order_id=ghost_order_id,
-                refund_date=_rand_date(rng, BASE_DATE, NUM_DAYS - 1 + 5),
-                currency=rng.choice(CURRENCIES),
-                amount_cents=amount,
-                reason=rng.choice(REFUND_REASONS),
-            )
+        orphan = Refund(
+            refund_id=next_refund_id(),
+            order_id=ghost_order_id,
+            refund_date=_rand_date(rng, BASE_DATE, NUM_DAYS - 1 + 5),
+            currency=rng.choice(CURRENCIES),
+            amount_cents=amount,
+            reason=rng.choice(REFUND_REASONS),
         )
-        truth_orphan_refund_amount += amount
+        refunds.append(orphan)
+        truth_amounts["orphan_refund"][orphan.currency] += amount
 
-    total_ordered_cents = sum(orders_by_id[oid].amount_cents for oid in completed_ids)
-    total_gross_cents = sum(p.amount_cents for p in payments)
-    total_refunds_cents = sum(r.amount_cents for r in refunds)
+    # Per-currency totals, straight from the generated records.
+    ordered_by_cur: dict[str, int] = defaultdict(int)
+    for oid in completed_ids:
+        ordered_by_cur[orders_by_id[oid].currency] += orders_by_id[oid].amount_cents
+    gross_by_cur: dict[str, int] = defaultdict(int)
+    for p in payments:
+        gross_by_cur[p.currency] += p.amount_cents
+    refunds_by_cur: dict[str, int] = defaultdict(int)
+    for r in refunds:
+        refunds_by_cur[r.currency] += r.amount_cents
+    currencies = sorted(set(ordered_by_cur) | set(gross_by_cur) | set(refunds_by_cur))
+
+    planted_counts = {
+        "missing_payment": N_MISSING_PAYMENT,
+        "overpayment": N_OVERPAYMENT,
+        "currency_mismatch": N_CURRENCY_MISMATCH,
+        "duplicate": N_DUPLICATE,
+        "orphan_refund": N_ORPHAN_REFUND,
+    }
 
     truth = {
         "seed": seed,
@@ -235,21 +252,25 @@ def generate_corpus(seed: int = 42) -> tuple[list[Order], list[Payment], list[Re
             "payments": len(payments),
             "refunds": len(refunds),
         },
+        # {currency: {...}} - never summed across currencies.
         "totals_cents": {
-            "gross": total_gross_cents,
-            "net": total_gross_cents - total_refunds_cents,
-            "refunds": total_refunds_cents,
-            "paid": total_gross_cents,
-            "ordered": total_ordered_cents,
-            "unmatched": truth_unmatched_amount,
+            cur: {
+                "gross": gross_by_cur[cur],
+                "net": gross_by_cur[cur] - refunds_by_cur[cur],
+                "refunds": refunds_by_cur[cur],
+                "paid": gross_by_cur[cur],
+                "ordered": ordered_by_cur[cur],
+                "unmatched": truth_unmatched[cur],
+            }
+            for cur in currencies
         },
         "unmatched_count": N_UNMATCHED_PAYMENT,
         "mismatches": {
-            "missing_payment": {"count": N_MISSING_PAYMENT, "amount_cents": truth_missing_amount},
-            "overpayment": {"count": N_OVERPAYMENT, "amount_cents": truth_overpay_amount},
-            "currency_mismatch": {"count": N_CURRENCY_MISMATCH, "amount_cents": truth_curmis_amount},
-            "duplicate": {"count": N_DUPLICATE, "amount_cents": truth_dup_amount},
-            "orphan_refund": {"count": N_ORPHAN_REFUND, "amount_cents": truth_orphan_refund_amount},
+            cat: {
+                "count": planted_counts[cat],
+                "amount_cents_by_currency": dict(sorted(truth_amounts[cat].items())),
+            }
+            for cat in planted_counts
         },
     }
 
@@ -299,15 +320,10 @@ def write_corpus(out_dir: Path, seed: int = 42) -> dict:
 
 
 def load_orders_fixture(path: Path) -> list[Order]:
+    """Load an orders.json fixture with the same validation the API client
+    applies (no silent int() truncation of fractional cents). A malformed
+    fixture raises MalformedRecordError."""
+    from .api_client import _order_from_json
+
     raw = json.loads(Path(path).read_text())
-    return [
-        Order(
-            order_id=r["order_id"],
-            customer_id=r["customer_id"],
-            order_date=date.fromisoformat(r["order_date"]),
-            currency=r["currency"],
-            amount_cents=int(r["amount_cents"]),
-            status=r["status"],
-        )
-        for r in raw
-    ]
+    return [_order_from_json(r) for r in raw]

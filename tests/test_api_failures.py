@@ -74,3 +74,77 @@ def test_pagination_across_multiple_pages():
         assert failures == []
         assert len(orders) == 60
         assert {o.order_id for o in orders} == {o.order_id for o in many}
+
+
+# --- malformed API data: categorised like malformed CSV rows, never a raw
+# KeyError/TypeError, and pagination can never loop forever.
+
+GOOD = {"order_id": "ORD-1", "customer_id": "CUST-1", "order_date": "2026-06-01",
+        "currency": "USD", "amount_cents": 1000, "status": "completed"}
+
+
+def _client_with_pages(pages):
+    client = OrdersApiClient("http://unused.invalid", max_pages=50)
+    calls = []
+
+    def fake_get(path):
+        calls.append(path)
+        page = int(path.split("page=")[1])
+        return pages(page)
+
+    client._get = fake_get
+    return client, calls
+
+
+def test_malformed_record_is_skipped_and_rest_of_page_kept():
+    bad = {**GOOD, "order_id": "ORD-2", "amount_cents": "1000"}  # string, not int cents
+    client, _ = _client_with_pages(lambda page: {"orders": [GOOD, bad], "page_size": 2, "total": 2})
+    orders, failures = client.fetch_all_orders()
+    assert [o.order_id for o in orders] == ["ORD-1"]
+    assert [(f.order_id, f.reason) for f in failures] == [("ORD-2", "malformed_record")]
+
+
+def test_non_dict_record_and_bool_amount_are_malformed_records():
+    client, _ = _client_with_pages(
+        lambda page: {"orders": ["not-an-object", {**GOOD, "amount_cents": True}], "page_size": 2, "total": 2}
+    )
+    orders, failures = client.fetch_all_orders()
+    assert orders == []
+    assert [f.reason for f in failures] == ["malformed_record", "malformed_record"]
+
+
+def test_missing_page_size_is_malformed_response_not_a_crash():
+    client, calls = _client_with_pages(lambda page: {"orders": [GOOD], "total": 5})
+    orders, failures = client.fetch_all_orders()
+    assert orders == []
+    assert len(failures) == 1 and failures[0].reason == "malformed_response"
+    assert len(calls) == 1
+
+
+def test_empty_pages_before_total_stop_the_fetch():
+    # Server claims 1000 orders but serves nothing: must not loop forever.
+    client, calls = _client_with_pages(lambda page: {"orders": [], "page_size": 25, "total": 1000})
+    orders, failures = client.fetch_all_orders()
+    assert orders == []
+    assert failures[0].reason == "malformed_response"
+    assert len(calls) == 1
+
+
+def test_page_limit_bounds_a_never_ending_listing():
+    # Every page is non-empty but the advertised total is never reached.
+    client, calls = _client_with_pages(
+        lambda page: {"orders": [{**GOOD, "order_id": f"ORD-{page}"}], "page_size": 1, "total": 10**9}
+    )
+    orders, failures = client.fetch_all_orders()
+    assert len(calls) == 50
+    assert len(orders) == 50
+    assert failures[-1].reason == "malformed_response"
+    assert "page limit" in failures[-1].detail
+
+
+def test_fetch_order_malformed_body_is_a_categorised_failure():
+    client = OrdersApiClient("http://unused.invalid")
+    client._get = lambda path: {"order_id": "ORD-1"}
+    result = client.fetch_order("ORD-1")
+    assert isinstance(result, ApiFailure)
+    assert result.reason == "malformed_record"
