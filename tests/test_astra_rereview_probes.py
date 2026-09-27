@@ -145,3 +145,63 @@ def test_empty_last_page_short_of_total_is_flagged_incomplete():
     assert orders == []
     assert len(failures) == 1
     assert failures[0].reason == "malformed_response"
+
+
+# --- High: a mid-fetch change in the advertised total can no longer pass
+# silently (frozen findings item 2, follow-up probe:
+# 40-sessions/2026-09-27-astra-revenue-reconciliation-pagination-probe.py).
+# Page 1 says total=3; page 2 says total=2. Two records are delivered in
+# total, which happens to equal page 2's total - so a check against only
+# the LATEST page's total sees "2 delivered == 2 advertised" and calls it
+# a clean, complete fetch, forgetting page 1's advertised third record.
+
+
+def _client_with_pages(pages):
+    client = OrdersApiClient("http://unused.invalid", max_pages=50)
+    calls = []
+
+    def fake_get(path):
+        calls.append(path)
+        page = int(path.split("page=")[1])
+        return pages(page)
+
+    client._get = fake_get
+    return client, calls
+
+
+def test_total_changing_between_pages_is_flagged_incomplete_not_silently_followed():
+    good = {
+        "order_id": "o", "customer_id": "c", "order_date": "2026-06-01",
+        "currency": "USD", "amount_cents": 10000, "status": "completed",
+    }
+
+    def page(n: int) -> dict:
+        if n == 1:
+            return {"orders": [{**good, "order_id": "o1"}], "page_size": 1, "total": 3}
+        return {"orders": [{**good, "order_id": "o2"}], "page_size": 1, "total": 2}
+
+    client, calls = _client_with_pages(page)
+    orders, failures = client.fetch_all_orders()
+    # The record from the still-valid first page is kept...
+    assert [o.order_id for o in orders] == ["o1"]
+    # ...but the total moving from 3 to 2 is a categorised failure, and the
+    # fetch stops immediately rather than accepting page 2's total as the
+    # new truth.
+    assert len(failures) == 1
+    assert failures[0].reason == "malformed_response"
+    assert "3" in failures[0].detail and "2" in failures[0].detail
+    assert len(calls) == 2
+
+
+def test_total_consistent_across_pages_still_completes_normally():
+    good = {
+        "order_id": "o", "customer_id": "c", "order_date": "2026-06-01",
+        "currency": "USD", "amount_cents": 10000, "status": "completed",
+    }
+    client, calls = _client_with_pages(
+        lambda n: {"orders": [{**good, "order_id": f"o{n}"}], "page_size": 1, "total": 2}
+    )
+    orders, failures = client.fetch_all_orders()
+    assert [o.order_id for o in orders] == ["o1", "o2"]
+    assert failures == []
+    assert len(calls) == 2

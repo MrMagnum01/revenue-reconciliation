@@ -163,7 +163,7 @@ export PYTHONPATH=src
 pytest tests -v
 ```
 
-58/58 passing. Covers:
+60/60 passing. Covers:
 - **Known-total reconciliation** (`test_generator_truth.py`) - the
   generator plants a disjoint set of mismatches per category and records
   ground truth independently; `reconcile()`'s output is asserted equal to
@@ -188,9 +188,12 @@ pytest tests -v
   complete empty source, a duplicate CSV header column is rejected instead
   of silently overwriting an earlier column's value, a currency string that
   collides with a reserved report key (e.g. `unmatched_count`) is rejected
-  at ingestion in both the CSV loaders and the API client, and a paginated
-  API fetch that stops short of its advertised total (a truncated or empty
-  last page) is reported incomplete rather than counted as success.
+  at ingestion in both the CSV loaders and the API client, a paginated API
+  fetch that stops short of its advertised total (a truncated or empty
+  last page) is reported incomplete rather than counted as success, and a
+  server that changes its advertised total partway through a fetch (e.g.
+  page 1 says 3, page 2 says 2) is reported incomplete rather than judged
+  against whichever total the last page happened to say.
 - **Reconciliation unit tests** (`test_reconcile_unit.py`) - one
   handcrafted case per mismatch category, isolated from the generator.
 - **Pipeline + CLI** (`test_pipeline_cli.py`) - end-to-end DuckDB write
