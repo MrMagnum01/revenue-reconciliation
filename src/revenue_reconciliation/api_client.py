@@ -26,7 +26,7 @@ import urllib.error
 import urllib.request
 from datetime import date
 
-from .models import ApiFailure, MalformedRecordError, Order
+from .models import SUPPORTED_CURRENCIES, ApiFailure, MalformedRecordError, Order
 
 ORDER_FIELDS = ("order_id", "customer_id", "order_date", "currency", "amount_cents", "status")
 ORDER_STATUSES = ("completed", "cancelled")
@@ -70,6 +70,7 @@ class OrdersApiClient:
         orders: list[Order] = []
         failures: list[ApiFailure] = []
         page = 1
+        delivered = 0  # raw records seen so far, valid or malformed - never inferred from page_size
         while True:
             if page > self.max_pages:
                 failures.append(
@@ -87,18 +88,32 @@ class OrdersApiClient:
                 failures.append(ApiFailure(None, "malformed_response", f"page {page}: {exc.reason}"))
                 return orders, failures
 
+            delivered += len(records)
             for raw in records:
                 try:
                     orders.append(_order_from_json(raw))
                 except MalformedRecordError as exc:
                     failures.append(ApiFailure(_safe_id(raw), "malformed_record", f"page {page}: {exc.reason}"))
 
-            if page * page_size >= total:
-                return orders, failures
-            if not records:
-                failures.append(
-                    ApiFailure(None, "malformed_response", f"page {page} is empty but total={total} not yet reached")
-                )
+            # A page can only be the last one if the advertised total has
+            # been reached OR the page came back short of its own page_size
+            # (the server would not hand back a partial non-final page).
+            # Either way, before declaring success we verify the actual
+            # number of raw records delivered across all pages equals the
+            # advertised total - reaching that arithmetic threshold is not
+            # by itself proof that every record was actually received.
+            # Malformed records still count as delivered-but-rejected here;
+            # they are reported separately from records never delivered.
+            is_last_page = (page * page_size >= total) or (len(records) < page_size)
+            if is_last_page:
+                if delivered != total:
+                    failures.append(
+                        ApiFailure(
+                            None,
+                            "malformed_response",
+                            f"page {page}: delivered {delivered} record(s) but advertised total is {total}",
+                        )
+                    )
                 return orders, failures
             page += 1
 
@@ -168,9 +183,14 @@ def _order_from_json(raw: object) -> Order:
     missing = [f for f in ORDER_FIELDS if f not in raw]
     if missing:
         raise bad(f"missing field(s) {missing} in order {raw.get('order_id')!r}")
-    for f in ("order_id", "customer_id", "order_date", "currency", "status"):
+    for f in ("order_id", "customer_id", "order_date", "status"):
         if not isinstance(raw[f], str) or not raw[f].strip():
             raise bad(f"{f} must be a non-empty string, got {raw[f]!r}")
+    currency = raw["currency"]
+    if not isinstance(currency, str) or currency not in SUPPORTED_CURRENCIES:
+        # An unrecognised currency string must never reach the report/DB
+        # result namespace (see reconcile.ReconciliationResult.totals).
+        raise bad(f"currency must be one of {sorted(SUPPORTED_CURRENCIES)}, got {currency!r}")
     amount = raw["amount_cents"]
     if not _is_int(amount):
         raise bad(f"amount_cents must be an integer number of cents, got {amount!r}")

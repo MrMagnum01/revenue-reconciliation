@@ -16,7 +16,7 @@ from datetime import date
 from pathlib import Path
 from typing import Callable, TypeVar
 
-from .models import MalformedRecordError, ParseError, Payment, Refund
+from .models import SUPPORTED_CURRENCIES, MalformedRecordError, ParseError, Payment, Refund
 
 PAYMENTS_FIELDS = ["payment_id", "order_id", "payment_date", "currency", "amount_cents", "method"]
 REFUNDS_FIELDS = ["refund_id", "order_id", "refund_date", "currency", "amount_cents", "reason"]
@@ -43,6 +43,13 @@ def _text(raw: str, field: str) -> str:
     return value
 
 
+def _parse_currency(raw: str) -> str:
+    value = _text(raw, "currency")
+    if value not in SUPPORTED_CURRENCIES:
+        raise ValueError(f"currency must be one of {sorted(SUPPORTED_CURRENCIES)}, got {value!r}")
+    return value
+
+
 def _load(
     path: Path,
     required: list[str],
@@ -62,8 +69,21 @@ def _load(
         reader = csv.reader(fh)
         header = next(reader, None)
         if header is None:
-            return records, errors  # empty file: nothing to load, nothing wrong
+            # A zero-byte / headerless file is not the same thing as a valid
+            # header-only (empty-table) file: there is no way to tell what
+            # columns it was supposed to have, so it must not be treated as
+            # a complete, empty source.
+            fail(1, [], "missing_columns", "file is empty: no header row found")
+            return records, errors
         header = [h.strip() for h in header]
+        duplicate_columns = sorted({h for h in header if header.count(h) > 1})
+        if duplicate_columns:
+            # dict(zip(header, raw)) below would silently let a later
+            # duplicate column's value overwrite an earlier one's (e.g. a
+            # second amount_cents column replacing the real amount), so
+            # duplicate column names are refused outright.
+            fail(1, header, "duplicate_columns", f"duplicate column name(s) in header: {duplicate_columns}")
+            return records, errors
         missing = [f for f in required if f not in header]
         if missing:
             fail(1, header, "missing_columns", f"missing columns: {missing}")
@@ -93,7 +113,7 @@ def _build_payment(row: dict[str, str]) -> Payment:
         payment_id=_text(row["payment_id"], "payment_id"),
         order_id=_text(row["order_id"], "order_id"),
         payment_date=_parse_date(row["payment_date"]),
-        currency=_text(row["currency"], "currency"),
+        currency=_parse_currency(row["currency"]),
         amount_cents=_parse_cents(row["amount_cents"]),
         method=_text(row["method"], "method"),
     )
@@ -104,7 +124,7 @@ def _build_refund(row: dict[str, str]) -> Refund:
         refund_id=_text(row["refund_id"], "refund_id"),
         order_id=_text(row["order_id"], "order_id"),
         refund_date=_parse_date(row["refund_date"]),
-        currency=_text(row["currency"], "currency"),
+        currency=_parse_currency(row["currency"]),
         amount_cents=_parse_cents(row["amount_cents"]),
         reason=_text(row["reason"], "reason"),
     )

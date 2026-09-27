@@ -16,10 +16,11 @@ so the whole pipeline can be demoed and tested without any real business
 data. No code, data, or client project is reused here.
 
 **Provenance:** This repository was implemented by AI coding agents and
-independently reviewed by a separate AI reviewer; the repository owner
-reviewed and approved the result. Everything described below as built has
-working code and a passing test in this repo; nothing here is described as
-done unless it is.
+independently reviewed by a separate AI reviewer across two review rounds
+(findings and fixes are not narrated here; see the repo history). Everything
+described below as built has working code and a passing test in this repo;
+nothing here is described as done unless it is. No claim is made about
+review or approval by anyone outside that AI-agent/AI-reviewer loop.
 
 ## What it does
 
@@ -103,9 +104,14 @@ The pipeline treats one row per source id (`order_id`, `payment_id`,
   and in `run_issues`, and the source is marked `partial`.
 - The same accepted rows feed both the report and the database.
 
-**Known limitation:** a genuine split tender - two distinct charges that
-happen to share one id - cannot be told apart from a conflict and is
-rejected as one. The pipeline does not attempt to solve this.
+**Known limitation:** the pipeline assumes one payment id per order. A
+genuine split tender - two distinct charges, each with its **own distinct
+payment id**, paying one order - is not treated as a conflict; it is
+matched normally and, since more than one payment now exists for that
+order, every payment after the first is flagged `duplicate`. Two rows
+sharing the *same* payment id with different contents remain a rejected id
+conflict. The pipeline does not attempt to distinguish a legitimate
+multi-payment order from a true duplicate.
 
 ## Setup
 
@@ -157,7 +163,7 @@ export PYTHONPATH=src
 pytest tests -v
 ```
 
-51/51 passing. Covers:
+58/58 passing. Covers:
 - **Known-total reconciliation** (`test_generator_truth.py`) - the
   generator plants a disjoint set of mismatches per category and records
   ground truth independently; `reconcile()`'s output is asserted equal to
@@ -177,6 +183,14 @@ pytest tests -v
   (report and DB agree), API outage recorded as `incomplete` with nothing
   asserted as unmatched, per-run KPI history preserved, all-or-nothing DB
   writes, malformed API records, fractional cents rejected.
+- **Re-review probes** (`test_astra_rereview_probes.py`) - a second
+  independent-review round: a zero-byte source file is never treated as a
+  complete empty source, a duplicate CSV header column is rejected instead
+  of silently overwriting an earlier column's value, a currency string that
+  collides with a reserved report key (e.g. `unmatched_count`) is rejected
+  at ingestion in both the CSV loaders and the API client, and a paginated
+  API fetch that stops short of its advertised total (a truncated or empty
+  last page) is reported incomplete rather than counted as success.
 - **Reconciliation unit tests** (`test_reconcile_unit.py`) - one
   handcrafted case per mismatch category, isolated from the generator.
 - **Pipeline + CLI** (`test_pipeline_cli.py`) - end-to-end DuckDB write
@@ -190,6 +204,10 @@ pytest tests -v
 - **No FX conversion.** Currency is read as the printed 3-letter code;
   `currency_mismatch` is detected, never auto-corrected or converted, and
   totals are reported per currency rather than as one grand total.
+- **Only `USD`, `EUR` and `GBP` are accepted currencies** (CSV rows and API
+  order records alike). Anything else - a typo, an unsupported code, or a
+  string chosen to collide with a report key such as `unmatched_count` - is
+  rejected at ingestion as an invalid record, not silently accepted.
 - **Raw tables are latest-state, not history.** `daily_kpis`,
   `mismatches`, `runs` and `run_issues` are kept per `run_id`, so earlier
   runs' KPIs stay as they were computed. The raw `orders`, `payments` and
@@ -199,7 +217,10 @@ pytest tests -v
 - **Writes are all-or-nothing per run** (one transaction); a failed write
   leaves no rows from that run. A database created by an earlier schema
   version is refused with a clear error - point `--db` at a new file.
-- **Split tender** under one payment id is rejected as an id conflict (see
+- **Split tender across distinct payment ids is not distinguished from a
+  legitimate multi-payment order** - both are matched normally, and every
+  payment after the first for an order is flagged `duplicate`. Split tender
+  under **one shared** payment id is rejected as an id conflict instead (see
   "One row per source id").
 - **Reconciliation is a single pass over one `payments.csv`/`refunds.csv`
   pair per run** - it does not track state across runs (e.g. a payment

@@ -16,6 +16,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 
+# The only currencies this demo's synthetic corpus and mock API ever use.
+# Ingestion (CSV loaders and the API client) rejects anything else, so a
+# malformed or adversarial currency string can never reach the report/DB
+# result namespace (see reconcile.ReconciliationResult.totals).
+SUPPORTED_CURRENCIES = frozenset({"USD", "EUR", "GBP"})
+
 
 class MalformedRecordError(ValueError):
     """A single input record (CSV row or API record) is structurally or
