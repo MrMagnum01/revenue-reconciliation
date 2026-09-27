@@ -11,10 +11,11 @@ categorised ingestion failure; nothing raises out of `fetch_all_orders` or
                        Same skip-and-report convention as the CSV loaders.
   malformed_response - a page body is unusable (not an object, missing or
                        invalid pagination fields, empty page before the
-                       advertised total, the advertised total changing
-                       between pages, page limit exceeded). The fetch
-                       stops there, since the remaining page count is
-                       unknown.
+                       advertised total, the advertised total or page_size
+                       changing between pages, page limit exceeded). The
+                       fetch stops there, since the remaining page count is
+                       unknown. `page_size`, like `total`, is bound once
+                       from page 1 and held for the rest of the fetch.
 
 A run with any ApiFailure has an incomplete orders source; the pipeline
 marks it so.
@@ -73,6 +74,7 @@ class OrdersApiClient:
         page = 1
         delivered = 0  # raw records seen so far, valid or malformed - never inferred from page_size
         expected_total: int | None = None  # bound from page 1; the API must not move this
+        expected_page_size: int | None = None  # bound from page 1; the API must not move this either
         while True:
             if page > self.max_pages:
                 failures.append(
@@ -90,19 +92,29 @@ class OrdersApiClient:
                 failures.append(ApiFailure(None, "malformed_response", f"page {page}: {exc.reason}"))
                 return orders, failures
 
-            # The advertised total is bound once, from page 1, and held for
-            # the rest of the fetch. A server that changes it mid-fetch has
-            # a moving target: nothing later can be trusted to add up
-            # against it, so this is a categorised failure, not a value to
-            # silently follow.
+            # The advertised total and page_size are each bound once, from
+            # page 1, and held for the rest of the fetch. A server that
+            # changes either mid-fetch has a moving target: nothing later
+            # can be trusted to add up against it, so this is a categorised
+            # failure, not a value to silently follow.
             if expected_total is None:
                 expected_total = total
+                expected_page_size = page_size
             elif total != expected_total:
                 failures.append(
                     ApiFailure(
                         None,
                         "malformed_response",
                         f"page {page}: advertised total changed from {expected_total} to {total}",
+                    )
+                )
+                return orders, failures
+            elif page_size != expected_page_size:
+                failures.append(
+                    ApiFailure(
+                        None,
+                        "malformed_response",
+                        f"page {page}: advertised page_size changed from {expected_page_size} to {page_size}",
                     )
                 )
                 return orders, failures
@@ -123,7 +135,7 @@ class OrdersApiClient:
             # by itself proof that every record was actually received.
             # Malformed records still count as delivered-but-rejected here;
             # they are reported separately from records never delivered.
-            is_last_page = (page * page_size >= expected_total) or (len(records) < page_size)
+            is_last_page = (page * expected_page_size >= expected_total) or (len(records) < expected_page_size)
             if is_last_page:
                 if delivered != expected_total:
                     failures.append(
